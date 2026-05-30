@@ -1,11 +1,11 @@
-"""阶段一 LLM 快速分类 — 约 500ms，temperature=0，结构化输出。
+"""Stage 1: LLM fast classification — ~500ms, temperature=0, structured output.
 
-参考系统 tools/approval._smart_approve 的 prompt 设计：
-  - 明确告知"多数命中是误报"（降低 LLM 的过度谨慎倾向）
-  - 注入危险信号上下文（从 stage1_rules 提取）
-  - 只输出 ALLOW / ESCALATE，不输出 DENY
+Follows system tools/approval._smart_approve prompt design:
+  - Explicitly tells LLM "most matches are false positives" (reduce over-caution)
+  - Injects risk signal context (extracted by stage1_rules)
+  - Only outputs ALLOW / ESCALATE, never DENY
 
-DENY 的决定权留给阶段二 ACP（有完整上下文和工具）或第二层系统审批。
+DENY authority is reserved for Stage 2 ACP (full context) or system layer.
 """
 
 from __future__ import annotations
@@ -24,46 +24,47 @@ def _build_classification_prompt(
     task_id: str,
     session_id: str,
 ) -> str:
-    """构造 LLM 分类 prompt，注入从 stage1_rules 提取的危险信号上下文。
+    """Build LLM classification prompt with risk signal context from stage1_rules.
 
-    参考系统 _smart_approve 的关键设计：
-      1. 明确告知 LLM"多数命中是误报"（防止过度拒绝）
-      2. 给出具体的误报例子帮助 LLM 校准
-      3. 注入匹配到的规则描述作为上下文
+    Follows system _smart_approve key design:
+      1. Tell LLM "most matches are false positives" (prevent over-denial)
+      2. Give concrete false-positive examples to calibrate
+      3. Inject matched rule descriptions as context
     """
     args_str = json.dumps(args, ensure_ascii=False, default=str)
     if len(args_str) > 2000:
         args_str = args_str[:2000] + "...(truncated)"
 
     signals = context.get("signals", [])
-    signals_text = "\n".join(f"  - {s}" for s in signals) if signals else "  - 无危险信号"
+    signals_text = "\n".join(f"  - {s}" for s in signals) if signals else "  - No risk signals"
 
-    return f"""你是 AI Agent 的安全审查员。评估以下工具调用是否安全。
+    return f"""You are an AI Agent safety reviewer. Evaluate whether the following tool call is safe.
 
-工具: {tool_name}
-参数: {args_str}
+Tool: {tool_name}
+Args: {args_str}
 
-【系统检测到的风险信号】
+[System-detected risk signals]
 {signals_text}
 
-重要提示 — 多数命中是误报:
-  许多被规则引擎标记的操作实际上是完全无害的。例如：
-  - `python -c "print('hello')"` 被标记为"通过 -c 标志执行脚本"，但实际上只是打印文本
-  - `rm -rf ./node_modules` 被标记为"递归删除"，但实际上只是清理项目依赖
+Important — most matches are false positives:
+  Many operations flagged by the rule engine are actually harmless. For example:
+  - `python -c "print('hello')"` is flagged as "executing script via -c flag", but it just prints text
+  - `rm -rf ./node_modules` is flagged as "recursive delete", but it is just cleaning project dependencies
 
-  请根据操作的 ACTUAL 风险来判断，而不仅仅是看规则标签。
+  Judge by the ACTUAL risk of the operation, not just the rule label.
 
-判断标准:
-  - ALLOW — 操作安全，不会造成系统损坏或数据丢失
-    例: 项目目录内的文件修改、构建操作、包管理、git 操作、
-         常规文件读写、在用户项目路径下的操作
-  - ESCALATE — 不确定，需要更深入的审查（交给阶段二 ACP 处理）
+Criteria:
+  - ALLOW — operation is safe, no risk of system damage or data loss
+    Examples: file modifications within project directories, build operations,
+             package management, git operations, normal file I/O,
+             operations under user project paths
+  - ESCALATE — unsure, needs deeper review (handled by Stage 2 ACP)
 
-路径判断:
-  - /home/、/mnt/f/、~/projects/ 等用户项目路径 → 大概率安全
-  - /etc/、/boot/、~/.ssh/ 等系统/安全路径 → 需要谨慎
+Path judgment:
+  - /home/, /mnt/f/, ~/projects/ etc. user project paths → likely safe
+  - /etc/, /boot/, ~/.ssh/ etc. system/security paths → exercise caution
 
-仅回答一个词: ALLOW 或 ESCALATE"""
+Answer with exactly one word: ALLOW or ESCALATE"""
 
 
 def llm_classify(
@@ -74,18 +75,18 @@ def llm_classify(
     task_id: str,
     session_id: str,
 ) -> str:
-    """调用 LLM 进行快速安全分类。
+    """Call LLM for fast safety classification.
 
     Args:
-        tool_name: 工具名
-        args: 工具参数
-        cfg: 插件配置
-        context: 从 stage1_rules.extract_context() 获取的风险信号
-        task_id: 任务 ID
-        session_id: 会话 ID
+        tool_name: Tool name
+        args: Tool arguments
+        cfg: Plugin config
+        context: Risk signals from stage1_rules.extract_context()
+        task_id: Task ID
+        session_id: Session ID
 
     Returns:
-        "ALLOW" | "ESCALATE"（不输出 DENY）
+        "ALLOW" | "ESCALATE" (never DENY)
     """
     fail_open = cfg.get("fail_open", True)
     timeout = cfg.get("stage1", {}).get("timeout", 5)
@@ -108,7 +109,7 @@ def llm_classify(
         if "ALLOW" in answer:
             return "ALLOW"
         else:
-            # 包括 "ESCALATE" 和任何无法识别的回答
+            # Including "ESCALATE" and any unrecognized answer
             return "ESCALATE"
 
     except Exception as exc:
