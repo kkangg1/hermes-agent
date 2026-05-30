@@ -1,27 +1,28 @@
-"""pre_tool_call 主回调调度器 — 两阶段审批入口。
+"""pre_tool_call main callback dispatcher — two-stage approval entry point.
 
-接管所有工具（含 terminal/process）。
+Covers all tools (including terminal/process).
 
-调用流：
-  SAFE_TOOLS → 直接放行 (0ms)
-  其余       → 提取上下文（stage1_rules.extract_context）
-               ↓
-            阶段一 LLM 快速分类（~500ms）
-              ALLOW    → 放行
-              ESCALATE → 阶段二 ACP 深度审查 (3-8s)
-                          ALLOW → 放行
-                          DENY  → 拒绝 + 结构化反馈
-                          故障  → return None（交系统处理）
+Call flow:
+  SAFE_TOOLS → direct pass (0ms)
+  Others      → extract context (stage1_rules.extract_context)
+                ↓
+              Stage 1 LLM fast classification (~500ms)
+                ALLOW    → pass
+                ESCALATE → Stage 2 ACP deep review (3-8s)
+                            ALLOW → pass
+                            DENY  → block + structured feedback
+                            Error → return None (delegate to system)
 
-设计原则：
-  第一层不做硬编码 DENY。危险信号仅作为 LLM 上下文注入，
-  LLM 只输出 ALLOW/ESCALATE。DENY 的决定权在阶段二 ACP。
+Design principles:
+  Stage 1 never makes hardcoded DENY decisions. Risk signals are only
+  injected as LLM context. LLM only outputs ALLOW/ESCALATE.
+  DENY authority resides in Stage 2 ACP.
 
-会话上下文：
-  从 Hermes session DB (SessionDB.get_messages) 直接查询：
-    - 工具调用链条（所有工具，含 SAFE_TOOLS）
-    - 最近对话（用户消息 + Assistant 回复）
-  零共享状态，天然并发安全。
+Session context:
+  Queried directly from Hermes session DB (SessionDB.get_messages):
+    - Tool call chain (all tools, including SAFE_TOOLS)
+    - Recent conversation (user messages + Agent replies)
+  Zero shared state, naturally concurrency-safe.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── 总是安全的工具（只读，跳过全部审查）─────────────────────────
+# ── Always-safe tools (read-only, skip all review) ─────────────────
 _SAFE_TOOLS = frozenset({
     "read_file", "search_files", "web_search", "web_extract",
     "session_search", "browser_snapshot", "browser_console",
@@ -42,7 +43,7 @@ _SAFE_TOOLS = frozenset({
     "lcm_status", "lcm_doctor", "lcm_load_session",
 })
 
-# ── 配置缓存 ─────────────────────────────────────────────────────
+# ── Config cache ───────────────────────────────────────────────────
 _config_cache: Optional[Dict[str, Any]] = None
 _config_disable: bool = False
 
@@ -69,7 +70,7 @@ def _load_config() -> Dict[str, Any]:
 
 
 def _summarize_tool_args(args: Dict[str, Any]) -> str:
-    """将工具参数压缩为简短文本。"""
+    """Compress tool args to a short text summary."""
     if not args:
         return ""
     if "command" in args:
@@ -92,12 +93,12 @@ def _get_session_context(
     tool_count: int = 10,
     turn_count: int = 3,
 ) -> Dict[str, Any]:
-    """从 Hermes session DB 获取会话上下文。
+    """Get session context from Hermes session DB.
 
-    返回:
+    Returns:
       {
-        "tool_calls": ["termial git status", "read_file nginx.conf", ...] (最近 tool_count 条),
-        "turns": ["👤 User: ...", "🤖 Agent: ...", "  → Tool: ..."] (最近 turn_count 轮),
+        "tool_calls": ["terminal git status", "read_file nginx.conf", ...] (last tool_count),
+        "turns": ["User: ...", "Agent: ...", "  Tool: ..."] (last turn_count rounds),
       }
     """
     result: Dict[str, Any] = {"tool_calls": [], "turns": []}
@@ -112,7 +113,7 @@ def _get_session_context(
         logger.debug("Session DB query failed: %s", exc)
         return result
 
-    # ── 提取工具调用链条 ────────────────────────────────────────
+    # ── Extract tool call chain ───────────────────────────────────
     tool_calls_raw: List[str] = []
     for msg in reversed(messages):
         tc_list = msg.get("tool_calls")
@@ -135,8 +136,8 @@ def _get_session_context(
             break
     result["tool_calls"] = list(reversed(tool_calls_raw))
 
-    # ── 提取最近对话轮次 ────────────────────────────────────────
-    # 将 messages 按 user→assistant(tool_calls)→tool_results 分组
+    # ── Extract recent conversation turns ─────────────────────────
+    # Group messages by user→assistant(tool_calls)→tool_results
     turns: List[str] = []
     current_turn: List[str] = []
     user_count = 0
@@ -148,11 +149,11 @@ def _get_session_context(
             user_count += 1
             content = str(msg.get("content", ""))
             text = content[:200] + "..." if len(content) > 200 else content
-            # 用户消息是回合起点 → 翻转并插入
+            # User message is turn start → reverse and insert
             if current_turn:
                 turns.insert(0, "\n".join(reversed(current_turn)))
                 current_turn = []
-            current_turn.insert(0, f"👤 User: {text}")
+            current_turn.insert(0, f"User: {text}")
             if user_count >= turn_count:
                 break
 
@@ -160,10 +161,10 @@ def _get_session_context(
             content = str(msg.get("content") or "")
             if content:
                 text = content[:150] + "..." if len(content) > 150 else content
-                current_turn.insert(0, f"🤖 Agent: {text}")
-            # 工具调用已在 tool_calls 中提取，这里不重复
+                current_turn.insert(0, f"Agent: {text}")
+            # Tool calls already extracted in tool_calls, not repeated here
 
-    # 最后一个未完成的回合
+    # Last incomplete turn
     if current_turn:
         turns.insert(0, "\n".join(reversed(current_turn)))
 
@@ -178,7 +179,7 @@ def pre_tool_call_handler(
     session_id: str = "",
     tool_call_id: str = "",
 ) -> Optional[Dict[str, str]]:
-    """pre_tool_call 钩子回调。"""
+    """pre_tool_call hook callback."""
     cfg = _load_config()
     if not cfg.get("enabled", False):
         return None
@@ -191,25 +192,26 @@ def pre_tool_call_handler(
     from .stage1_rules import extract_context
     context = extract_context(tool_name, tool_args, cfg)
 
-    # ── Terminal 优化：无风险信号 → 跳过 LLM（0ms）────────────────
-    # 注意：HARDLINE 匹配的信号以 "⚠️ 触发 HARDLINE" 开头，不算"无信号"
-    #       这类命令不应快跳——让 LLM 看到，且系统第二层会做最终拦截
+    # ── Terminal optimization: no risk signals → skip LLM (0ms) ────
+    # Note: HARDLINE signals start with "WARNING: HARDLINE pattern triggered"
+    #       — these should NOT be considered "real risk" for fast-path,
+    #       since LLM cannot override HARDLINE anyway.
     if tool_name == "terminal":
         signals = context.get("signals", [])
         has_real_risk = any(
-            "⚠️" in s and "HARDLINE" not in s
+            "WARNING" in s and "HARDLINE" not in s
             for s in signals
         )
         if not has_real_risk:
-            # 无 DANGEROUS 匹配，直接放行。系统 HARDLINE 在第二层兜底
+            # No DANGEROUS match, pass through. System HARDLINE is the safety net.
             return None
 
     from .stage1_llm import llm_classify
     verdict = llm_classify(tool_name, tool_args, cfg, context, task_id, session_id)
     if verdict == "ALLOW":
-        # ── Terminal 优化：LLM 已批准 → 预写 approve_session 标记 ──
-        #     这样系统 check_all_command_guards 运行时，
-        #     is_approved() 返回 True → 跳过 DANGEROUS 检测和第二次 LLM
+        # ── Terminal optimization: LLM approved → pre-write approve_session marker ──
+        #     So when system check_all_command_guards runs,
+        #     is_approved() returns True → skips DANGEROUS check and second LLM
         if tool_name == "terminal":
             pattern_keys = context.get("dangerous_pattern_keys", [])
             if pattern_keys:
@@ -235,7 +237,7 @@ def pre_tool_call_handler(
     if not cfg_stage2.get("enabled", True):
         return None
 
-    # 从 session DB 获取完整上下文（工具链条 + 对话）
+    # Get full context from session DB (tool chain + conversation)
     session_ctx = _get_session_context(session_id)
 
     try:

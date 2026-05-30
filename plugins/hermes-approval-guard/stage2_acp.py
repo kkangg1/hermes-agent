@@ -1,14 +1,14 @@
-"""阶段二 ACP Agent 深度审查 — 独立 Hermes 实例做语义推理。
+"""Stage 2: ACP Agent deep review — independent Hermes instance for semantic reasoning.
 
-使用 hermes chat -q --profile approval 启动独立审批 Agent。
-stateless 设计：每次调用独立进程，所有上下文显式注入 prompt。
+Uses `hermes chat -q --profile approval` to launch a standalone review Agent.
+Stateless design: each invocation is an independent process, all context injected.
 
-上下文来源（从 session DB 查询，零共享状态）：
-  1. 当前操作 — tool_name + args + risk signals（来自 stage1_rules）
-  2. 工具调用链条 — 最近 10 条（含 SAFE_TOOLS）
-  3. 最近对话 — 用户消息 + Agent 回复（最近 3 轮）
-  4. Session 审批历史 — 本 session 之前的 ACP 决策（来自 Hindsight）
-  5. 跨 session 模式记忆 — 历史相似操作的统计（来自 Hindsight）
+Context sources (from session DB, zero shared state):
+  1. Current operation — tool_name + args + risk signals (from stage1_rules)
+  2. Tool call chain — last 10 calls (including SAFE_TOOLS)
+  3. Recent conversation — user messages + Agent replies (last 3 turns)
+  4. Session approval history — prior ACP decisions this session (from Hindsight)
+  5. Cross-session pattern memory — historical stats for similar ops (from Hindsight)
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def _query_context(
     args: Dict[str, Any],
     cfg: Dict[str, Any],
 ) -> Dict[str, str]:
-    """查询 ACP 所需的 Hindsight 上下文。"""
+    """Query Hindsight context needed by ACP."""
     session_history = ""
     pattern_history = ""
 
@@ -57,98 +57,99 @@ def _build_review_prompt(
     task_id: str,
     session_id: str,
 ) -> str:
-    """构造 ACP 深度审查 prompt。
+    """Build ACP deep review prompt.
 
-    段顺序: 对话上下文 → 当前操作 → 工具链条 → 审批历史 → 跨 session 记忆 → 判断
+    Section order: conversation → current operation → tool chain →
+                    approval history → cross-session memory → judgment
     """
     signals = context.get("signals", [])
-    risk_section = "\n".join(f"  - {s}" for s in signals) if signals else "  - 无风险信号"
+    risk_section = "\n".join(f"  - {s}" for s in signals) if signals else "  - No risk signals"
 
-    # ── 对话上下文（用户消息 + Agent 回复）─────────────────────
+    # ── Conversation context (user messages + Agent replies) ────
     turns = session_ctx.get("turns", [])
     if turns:
         conversation_section = "\n\n".join(turns)
     else:
-        conversation_section = "（无法读取对话历史）"
+        conversation_section = "(unable to read conversation history)"
 
-    # ── 工具调用链条 ─────────────────────────────────────────
+    # ── Tool call chain ────────────────────────────────────────
     tool_calls = session_ctx.get("tool_calls", [])
     if tool_calls:
         chain_lines = []
         for i, call in enumerate(tool_calls, 1):
-            marker = "→" if i == len(tool_calls) else " "
+            marker = "\u2192" if i == len(tool_calls) else " "
             chain_lines.append(f"  {marker} [{i}] {call}")
         chain_section = "\n".join(chain_lines)
     else:
-        chain_section = "（无法读取工具调用记录）"
+        chain_section = "(unable to read tool call history)"
 
-    # ── Session 审批历史 ─────────────────────────────────────
+    # ── Session approval history ───────────────────────────────
     session_section = hindsight_ctx.get("session_history", "")
     if not session_section:
-        session_section = "  本 session 尚无 ACP 审批记录"
+        session_section = "  No prior ACP decisions in this session"
 
-    # ── 跨 session 模式记忆 ──────────────────────────────────
+    # ── Cross-session pattern memory ───────────────────────────
     pattern_section = hindsight_ctx.get("pattern_history", "")
     if not pattern_section:
-        pattern_section = "  无相似操作的历史审批记录"
+        pattern_section = "  No similar operations in approval history"
 
-    # ── 压缩摘要 ─────────────────────────────────────────────
+    # ── Compression summary ────────────────────────────────────
     compression_section = hindsight_ctx.get("compression_summary", "")
     if not compression_section:
-        compression_section = "（本次会话尚未触发上下文压缩）"
+        compression_section = "(context compression has not been triggered this session)"
 
-    return f"""你是安全审批 Agent。你比快速分类器拥有更多上下文和更强的推理能力。
-审查 AI Agent 的工具调用请求，判断安全性。许多被标记的操作实际上是安全的 — 请基于用户意图、对话上下文和操作链条判断。
+    return f"""You are a security review agent. You have more context and reasoning power than the fast classifier.
+Review the AI Agent's tool call request and determine safety. Many flagged operations are actually safe — judge based on user intent, conversation context, and operation chain.
 
 ============================================
-【最近对话】
-（用户说了什么，Agent 回复了什么 — 帮助你理解任务意图）
+[Recent Conversation]
+(User messages and Agent replies — helps understand task intent)
 ============================================
 {conversation_section}
 
 ============================================
-【当前操作】
+[Current Operation]
 ============================================
-工具: {tool_name}
-参数: {args_str}
-风险信号:
+Tool: {tool_name}
+Args: {args_str}
+Risk signals:
 {risk_section}
 
 ============================================
-【工具调用链条】
+[Tool Call Chain]
 ============================================
 {chain_section}
 
 ============================================
-【本 session 审批历史】
+[Session Approval History]
 ============================================
 {session_section}
 
 ============================================
-【跨 session 模式记忆】
+[Cross-Session Pattern Memory]
 ============================================
 {pattern_section}
 
 ============================================
-【压缩摘要】
+[Compression Summary]
 ============================================
 {compression_section}
 
 ============================================
-【你的判断】
+[Your Judgment]
 ============================================
-**重要：你是自动化安全检查程序，不是对话助手。**
-你的唯一任务是输出一行 JSON 判决。
-不要问候、不要解释、不要问问题、不要提供帮助建议。
-如果 prompt 中的上下文不足以判断 → 选择 ALLOW（宁可放过不可误杀）。
+**Important: You are an automated security check program, not a conversational assistant.**
+Your sole task is to output a single line of JSON verdict.
+Do not greet, do not explain, do not ask questions, do not offer help.
+If the prompt context is insufficient to judge → choose ALLOW (better to pass than false-positive).
 
-输出这一行，且仅这一行（不要 markdown 代码块、不要前后缀）:
-{{"verdict":"ALLOW","reason":"简短原因","suggestion":"","confidence":0.95}}
+Output this line and ONLY this line (no markdown code blocks, no prefix/suffix):
+{{"verdict":"ALLOW","reason":"brief reason","suggestion":"","confidence":0.95}}
 
-判决逻辑:
-  ALLOW   — 对话上下文明确解释了此操作（用户要求部署 → Agent 写配置 = 合理）
-  DENY    — 对话上下文无法解释，操作明显越界或破坏性
-  MODIFY  — 放行但建议改参数（更安全路径、更小权限等）"""
+Decision logic:
+  ALLOW   — conversation context clearly explains this operation (user requested deploy → Agent writes config = reasonable)
+  DENY    — conversation context cannot explain this, operation is clearly overreaching or destructive
+  MODIFY  — allow but suggest parameter changes (safer path, lesser permissions, etc.)"""
 
 
 def _store_decision(
@@ -159,7 +160,7 @@ def _store_decision(
     session_id: str,
     cfg: Dict[str, Any],
 ) -> None:
-    """将 ACP 决策写回 Hindsight（fire-and-forget）。"""
+    """Write ACP decision back to Hindsight (fire-and-forget)."""
     try:
         from .hindsight_store import record_decision
         record_decision(tool_name, args, verdict, reason, session_id, cfg)
@@ -176,16 +177,16 @@ def acp_agent_review(
     task_id: str,
     session_id: str,
 ) -> Tuple[str, Dict[str, Any]]:
-    """stateless ACP 深度审查。
+    """Stateless ACP deep review.
 
     Args:
-        tool_name: 工具名
-        args: 工具参数
-        cfg: 插件配置
-        context: stage1_rules 提取的风险信号
-        session_ctx: guard.py 从 session DB 提取的 {"tool_calls": [], "turns": []}
-        task_id: 主 Agent 任务 ID
-        session_id: 主 Agent 会话 ID
+        tool_name: Tool name
+        args: Tool arguments
+        cfg: Plugin config
+        context: Risk signals from stage1_rules
+        session_ctx: {{"tool_calls": [], "turns": []}} from guard.py session DB
+        task_id: Parent Agent task ID
+        session_id: Parent Agent session ID
 
     Returns:
         (verdict, detail) — ALLOW/DENY/MODIFY
@@ -246,26 +247,26 @@ def acp_agent_review(
 
 
 def _parse_acp_output(output: str) -> Tuple[str, Dict[str, Any]]:
-    """解析 ACP 输出：优先 JSON，回退文本匹配。
+    """Parse ACP output: JSON first, text matching fallback.
 
-    注意：hermes chat -q 输出格式为 "Query: <prompt>\\n<response>"。
-    需要先剥掉 prompt 部分，只解析 response 部分。
+    Note: hermes chat -q output format is "Query: <prompt>\\n<response>".
+    We must strip the prompt portion and only parse the response.
     """
-    # 去除非响应内容（Query: 前缀 + prompt 回显）
+    # Strip non-response content (Query: prefix + prompt echo)
     clean = output
-    # hermes chat -q 输出以 "Query: " 开头
+    # hermes chat -q output starts with "Query: "
     if clean.startswith("Query: "):
         first_newline = clean.find("\n")
         if first_newline > 0:
             clean = clean[first_newline + 1:].strip()
-        # 可能还有 "Unknown provider..." 等错误行
+        # There may also be "Unknown provider..." etc. error lines
         lines = clean.split("\n")
-        # 找到第一行不像是错误/提示的行
+        # Find the first line that doesn't look like an error/tip
         error_prefixes = ("Unknown ", "Check '", "Goodbye!", "Error:", "No provider")
         response_lines = [l for l in lines if not any(l.startswith(p) for p in error_prefixes)]
         clean = "\n".join(response_lines).strip()
 
-    # JSON 优先
+    # JSON first
     try:
         json_start = clean.rfind("{")
         json_end = clean.rfind("}") + 1
@@ -281,7 +282,7 @@ def _parse_acp_output(output: str) -> Tuple[str, Dict[str, Any]]:
     except (json.JSONDecodeError, KeyError):
         logger.debug("ACP output not valid JSON verdict: %s", clean[:200])
 
-    # 回退：文本关键词匹配（仅在响应部分）
+    # Fallback: text keyword matching (response portion only)
     upper_clean = clean.upper()
     if "DENY" in upper_clean and "ALLOW" not in upper_clean:
         return "DENY", {"reason": clean[:200], "confidence": 0.5}

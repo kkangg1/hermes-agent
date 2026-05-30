@@ -137,7 +137,7 @@ Launches `hermes chat -q --profile approval`. Prompt has 5 sections:
 4. **Session approval history** — Previous ACP decisions this session (from Hindsight)
 5. **Cross-session patterns** — Similar operations' ALLOW/DENY history (from Hindsight)
 
-The prompt explicitly instructs the LLM: "你是自动化安全检查程序，不是对话助手" to prevent
+The prompt explicitly instructs the LLM: "You are an automated security check program, not a conversational assistant" to prevent
 non-JSON output. Falls back to text matching if JSON parsing fails.
 
 Enable with `plugin_guard.stage2.enabled: true`.
