@@ -107,15 +107,30 @@ def _get_session_context(
       }
     """
     result: Dict[str, Any] = {"tool_calls": [], "turns": []}
-    if not session_id:
+    # When the upstream invoke_tool fix is not yet merged, the hook
+    # receives an empty session_id.  Fall back to the value stashed by
+    # __init__.py's monkey-patch via thread-local storage.
+    effective_id = session_id
+    if not effective_id:
+        try:
+            from . import _get_session_id_from_agent
+            effective_id = _get_session_id_from_agent()
+        except Exception:
+            pass
+    if not effective_id:
+        logger.warning("_get_session_context: session_id is empty — cannot query SessionDB")
         return result
 
     try:
         from hermes_state import SessionDB
         db = SessionDB()
-        messages = db.get_messages(session_id)
+        messages = db.get_messages(effective_id)
+        logger.debug(
+            "_get_session_context: session_id=%s, messages=%d",
+            effective_id, len(messages),
+        )
     except Exception as exc:
-        logger.debug("Session DB query failed: %s", exc)
+        logger.warning("Session DB query failed for %s: %s", effective_id, exc)
         return result
 
     # ── Extract tool call chain ───────────────────────────────────
