@@ -16,7 +16,9 @@ import os
 import importlib.util
 from unittest.mock import MagicMock, patch
 
-GITEA_DIR = os.path.expanduser("~/gitea/hermes-agent/plugins/hermes-approval-guard")
+# Resolve plugin directory relative to this test file
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+GITEA_DIR = _THIS_DIR
 passed = failed = 0
 
 

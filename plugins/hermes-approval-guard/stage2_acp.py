@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os as _os
+import signal
 import subprocess
 from typing import Any, Dict, List, Tuple
 
@@ -207,26 +208,46 @@ def acp_agent_review(
     )
 
     try:
-        result = subprocess.run(
+        # Use Popen rather than subprocess.run so we can kill the entire
+        # process group on timeout — subprocess.run only kills the direct
+        # child, leaving grandchild processes (e.g. hermes chat subprocesses)
+        # orphaned.
+        proc = subprocess.Popen(
             [
                 "hermes", "chat", "-q", review_prompt,
                 "--profile", profile,
-                "-t", "file,terminal,memory,session_search",
+                "-t", "file,memory,session_search",
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout + 5,
+            start_new_session=True,
             env={**_os.environ, "HERMES_YOLO_MODE": "1"},
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout + 5)
+        except subprocess.TimeoutExpired:
+            # Kill entire process group so no orphans survive
+            try:
+                _os.killpg(_os.getpgid(proc.pid), signal.SIGTERM)
+                try:
+                    stdout, stderr = proc.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    _os.killpg(_os.getpgid(proc.pid), signal.SIGKILL)
+                    stdout, stderr = proc.communicate()
+            except (ProcessLookupError, OSError):
+                stdout, stderr = "", ""
+            raise  # Re-raise so the outer except block below handles it
 
-        output = result.stdout.strip()
+        output = stdout.strip()
 
-        if result.returncode != 0:
-            logger.warning("ACP agent returned non-zero: %s", result.stderr[:200])
-            _store_decision(tool_name, args, "ERROR", f"acp_error(code={result.returncode})", session_id, cfg)
+        returncode = proc.returncode
+        if returncode != 0:
+            logger.warning("ACP agent returned non-zero: %s", stderr[:200])
+            _store_decision(tool_name, args, "ERROR", f"acp_error(code={returncode})", session_id, cfg)
             if fail_open:
                 return "ALLOW", {"reason": "acp_error", "confidence": 0.0}
-            return "DENY", {"reason": f"acp_error(code={result.returncode})", "confidence": 0.0}
+            return "DENY", {"reason": f"acp_error(code={returncode})", "confidence": 0.0}
 
         parsed_verdict, detail = _parse_acp_output(output)
         _store_decision(tool_name, args, parsed_verdict, detail.get("reason", ""), session_id, cfg)
