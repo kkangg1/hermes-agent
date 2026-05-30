@@ -207,7 +207,6 @@ def acp_agent_review(
             [
                 "hermes", "chat", "-q", review_prompt,
                 "--profile", profile,
-                "--provider", cfg.get("provider", "zjic"),
                 "-t", "file,terminal,memory,session_search",
             ],
             capture_output=True,
@@ -244,25 +243,48 @@ def acp_agent_review(
 
 
 def _parse_acp_output(output: str) -> Tuple[str, Dict[str, Any]]:
-    """解析 ACP 输出：优先 JSON，回退文本匹配。"""
-    try:
-        json_start = output.rfind("{")
-        json_end = output.rfind("}") + 1
-        if json_start >= 0 and json_end > json_start:
-            parsed = json.loads(output[json_start:json_end])
-            verdict = parsed.get("verdict", "ALLOW").upper()
-            return verdict, {
-                "reason": parsed.get("reason", ""),
-                "suggestion": parsed.get("suggestion", ""),
-                "confidence": parsed.get("confidence", 0.5),
-            }
-    except json.JSONDecodeError:
-        logger.debug("ACP output not valid JSON: %s", output[:200])
+    """解析 ACP 输出：优先 JSON，回退文本匹配。
 
-    upper_output = output.upper()
-    if "DENY" in upper_output:
-        return "DENY", {"reason": output[:200], "confidence": 0.5}
-    elif "MODIFY" in upper_output:
-        return "MODIFY", {"reason": output[:200], "confidence": 0.5}
+    注意：hermes chat -q 输出格式为 "Query: <prompt>\\n<response>"。
+    需要先剥掉 prompt 部分，只解析 response 部分。
+    """
+    # 去除非响应内容（Query: 前缀 + prompt 回显）
+    clean = output
+    # hermes chat -q 输出以 "Query: " 开头
+    if clean.startswith("Query: "):
+        first_newline = clean.find("\n")
+        if first_newline > 0:
+            clean = clean[first_newline + 1:].strip()
+        # 可能还有 "Unknown provider..." 等错误行
+        lines = clean.split("\n")
+        # 找到第一行不像是错误/提示的行
+        error_prefixes = ("Unknown ", "Check '", "Goodbye!", "Error:", "No provider")
+        response_lines = [l for l in lines if not any(l.startswith(p) for p in error_prefixes)]
+        clean = "\n".join(response_lines).strip()
+
+    # JSON 优先
+    try:
+        json_start = clean.rfind("{")
+        json_end = clean.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            parsed = json.loads(clean[json_start:json_end])
+            verdict = parsed.get("verdict", "ALLOW").upper()
+            if verdict in ("ALLOW", "DENY", "MODIFY"):
+                return verdict, {
+                    "reason": parsed.get("reason", ""),
+                    "suggestion": parsed.get("suggestion", ""),
+                    "confidence": parsed.get("confidence", 0.5),
+                }
+    except (json.JSONDecodeError, KeyError):
+        logger.debug("ACP output not valid JSON verdict: %s", clean[:200])
+
+    # 回退：文本关键词匹配（仅在响应部分）
+    upper_clean = clean.upper()
+    if "DENY" in upper_clean and "ALLOW" not in upper_clean:
+        return "DENY", {"reason": clean[:200], "confidence": 0.5}
+    elif "MODIFY" in upper_clean:
+        return "MODIFY", {"reason": clean[:200], "confidence": 0.5}
+    elif "ALLOW" in upper_clean:
+        return "ALLOW", {"reason": clean[:200], "confidence": 0.5}
     else:
-        return "ALLOW", {"reason": output[:200], "confidence": 0.3}
+        return "ALLOW", {"reason": "acp_unclear", "confidence": 0.3}
