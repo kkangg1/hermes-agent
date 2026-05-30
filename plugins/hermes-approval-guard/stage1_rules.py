@@ -20,7 +20,10 @@ Returns:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # ── Sensitive paths (context hints only, no hardcoded denial) ─────
@@ -65,9 +68,11 @@ def _get_sensitive_signals_for_write(path: str) -> List[str]:
 
 
 def _get_terminal_risk_signals(command: str) -> Tuple[List[str], List[str]]:
-    """Run dangerous/hardline regex detection on terminal commands.
+    """Run dangerous/hardline regex + tirith detection on terminal commands.
 
-    Imports system tools.approval detection functions, reusing 12 HARDLINE + 47 DANGEROUS regex patterns.
+    Imports system tools.approval detection functions + tirith security scanner,
+    reusing 12 HARDLINE + 47 DANGEROUS regex patterns plus tirith's richer rule set
+    (pipe-to-interpreter, sudo abuse, etc.).
 
     Returns:
         (signals, dangerous_pattern_keys)
@@ -93,6 +98,23 @@ def _get_terminal_risk_signals(command: str) -> Tuple[List[str], List[str]]:
         if is_dangerous:
             signals.append(f"WARNING: Dangerous pattern triggered: {description}")
             pattern_keys.append(pattern_key)
+
+        # --- Tirith security scan (richer rules: pipe-to-interpreter, sudo abuse, etc.) ---
+        try:
+            from tools.tirith_security import check_command_security
+            tirith_result = check_command_security(command)
+            if tirith_result.get("action") in {"warn", "block"}:
+                findings = tirith_result.get("findings") or []
+                for f in findings[:10]:  # Cap at 10 findings to avoid prompt bloat
+                    desc = f.get("description") or f.get("message") or str(f)
+                    rule_id = f.get("rule_id", "tirith")
+                    signals.append(
+                        f"WARNING: Tirith security scan: [{rule_id}] {desc}"
+                    )
+        except ImportError:
+            pass  # tirith not installed — skip, regex patterns alone are sufficient
+        except Exception as exc:
+            logger.warning("Tirith scan failed: %s, falling back to regex only", exc)
 
         if not signals:
             signals.append("No known dangerous patterns matched (likely a safe routine operation)")

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -45,14 +46,17 @@ _SAFE_TOOLS = frozenset({
 
 # ── Config cache ───────────────────────────────────────────────────
 _config_cache: Optional[Dict[str, Any]] = None
+_config_cache_time: float = 0
+_config_cache_ttl: float = 30  # seconds — refresh config periodically
 _config_disable: bool = False
 
 
 def _load_config() -> Dict[str, Any]:
-    global _config_cache, _config_disable
+    global _config_cache, _config_disable, _config_cache_time
     if _config_disable:
         return {"enabled": False}
-    if _config_cache is not None:
+    # Refresh cache if TTL expired — allows config changes without gateway restart
+    if _config_cache is not None and (time.monotonic() - _config_cache_time) < _config_cache_ttl:
         return _config_cache
     try:
         from hermes_cli.config import load_config
@@ -61,6 +65,7 @@ def _load_config() -> Dict[str, Any]:
         if not isinstance(guard_cfg, dict):
             guard_cfg = {}
         _config_cache = guard_cfg
+        _config_cache_time = time.monotonic()
         if not guard_cfg.get("enabled", False):
             _config_disable = True
         return guard_cfg
