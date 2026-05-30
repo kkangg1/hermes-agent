@@ -31,8 +31,15 @@ plugins:
 # ── Approval guard config ─────────────────────────────────
 plugin_guard:
   enabled: false                    # <- change to true to enable
-  provider: zjic                    # approval LLM provider
-  model: qwen-3.6-27b-fast          # fast model, <500ms response
+
+  # ── Approval LLM (Stage 1) ─────────────────────────────────
+  # Optional. When omitted, defaults to the main Agent LLM (same as
+  # call_llm auto-detection). To use a different LLM, set the provider
+  # and model — same format as auxiliary.<task>.provider/model.
+  # The provider must already be registered in Hermes (run `hermes setup`
+  # or check ~/.hermes/config.yaml under `providers`).
+  # provider: your_provider_name     # optional, defaults to main LLM
+  # model: your_model_name           # optional, defaults to main LLM
   fail_open: true                   # LLM unavailable -> allow (fail-safe)
 
   stage1:

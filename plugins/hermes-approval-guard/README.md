@@ -16,8 +16,8 @@ plugins:
 
 plugin_guard:
   enabled: true
-  provider: zjic
-  model: qwen-3.6-27b-fast
+  # provider: your_provider_name     # optional, defaults to main Agent LLM
+  # model: your_model_name           # optional, defaults to main Agent LLM
   fail_open: true
 
   stage2:
@@ -173,8 +173,8 @@ System check_all_command_guards → terminal HARDLINE safety net (always active)
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `plugin_guard.enabled` | bool | `false` | Master switch |
-| `plugin_guard.provider` | str | — | LLM provider for classification |
-| `plugin_guard.model` | str | — | Model name (fast, e.g. `qwen-3.6-27b-fast`) |
+| `plugin_guard.provider` | str | — | LLM provider (optional, defaults to main LLM) |
+| `plugin_guard.model` | str | — | Model name (optional, defaults to main LLM) |
 | `plugin_guard.fail_open` | bool | `true` | LLM failure → allow (safe default) |
 | `plugin_guard.stage1.timeout` | int | `5` | Seconds for LLM classification |
 | `plugin_guard.stage2.enabled` | bool | `false` | Enable ACP deep review |

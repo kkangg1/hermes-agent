@@ -234,7 +234,7 @@ def pre_tool_call_handler(
         return None
 
     cfg_stage2 = cfg.get("stage2", {})
-    if not cfg_stage2.get("enabled", True):
+    if not cfg_stage2.get("enabled", False):
         return None
 
     # Get full context from session DB (tool chain + conversation)

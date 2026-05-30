@@ -90,6 +90,13 @@ def llm_classify(
     """
     fail_open = cfg.get("fail_open", True)
     timeout = cfg.get("stage1", {}).get("timeout", 5)
+    # Read provider/model from plugin_guard config so the user's
+    # plugin_guard.provider / plugin_guard.model actually takes effect.
+    # call_llm resolution path: explicit args → auxiliary.{task} → "auto"
+    # Without explicit args, call_llm looks in auxiliary.approval, which is
+    # a different config namespace — plugin_guard config would be ignored.
+    explicit_provider = cfg.get("provider")
+    explicit_model = cfg.get("model")
 
     try:
         from agent.auxiliary_client import call_llm
@@ -99,6 +106,8 @@ def llm_classify(
         )
         response = call_llm(
             task="approval",
+            provider=explicit_provider,
+            model=explicit_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=32,
