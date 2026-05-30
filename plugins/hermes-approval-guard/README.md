@@ -21,7 +21,7 @@ plugin_guard:
   fail_open: true
 
   stage2:
-    enabled: true                        # optional: deep review
+    enabled: false                       # optional: deep review
     profile: approval                    # ~/.hermes/profiles/approval/config.yaml
     timeout: 15
 
@@ -44,19 +44,22 @@ hermes plugins list | grep approval-guard
 
 ```
 Tool call → pre_tool_call hook
-  ├─ SAFE_TOOLS (13 read/query tools) → ALLOW (0ms)
+  ├─ SAFE_TOOLS (21 read/query tools) → ALLOW (0ms)
   ├─ extract_context — reuses system detect_dangerous/hardline_command
   ├─ Terminal fast-path: no DANGEROUS match → ALLOW (0ms)
   │   • HARDLINE-only signals (rm -rf /) → skip LLM, let system layer block
   ├─ Stage 1: LLM fast-classify → ALLOW / ESCALATE (~500ms)
   │   • Uses call_llm(task="approval") with context-aware prompt
   │   • NEVER outputs DENY — DENY reserved for Stage 2 / system HARDLINE
+  │   • LLM config: provider/model optional — unset defaults to main Agent LLM
   │   • On ALLOW: calls approve_session() to pre-mark DANGEROUS patterns
   │     → system's check_all_command_guards skips redundant LLM call
   └─ Stage 2: ACP Agent deep review (3-8s, optional)
       • Stateless: no persistent session; all context injected in prompt
       • Context from SessionDB: conversation + full tool call chain
       • Hindsight-backed: session-level + cross-session pattern memory
+      • Restricted toolsets (file,memory,session_search — no terminal)
+      • Timeout → process group killed (SIGTERM → 3s → SIGKILL)
       • Outputs: ALLOW / DENY / MODIFY with structured JSON feedback
 ```
 
@@ -139,6 +142,9 @@ Launches `hermes chat -q --profile approval`. Prompt has 5 sections:
 
 The prompt explicitly instructs the LLM: "You are an automated security check program, not a conversational assistant" to prevent
 non-JSON output. Falls back to text matching if JSON parsing fails.
+
+**Subprocess safety:** The ACP agent is launched with restricted toolsets (`file,memory,session_search` — no `terminal`).
+On timeout, the entire process group is killed (SIGTERM → 3s grace → SIGKILL) to prevent orphan processes.
 
 Enable with `plugin_guard.stage2.enabled: true`.
 
