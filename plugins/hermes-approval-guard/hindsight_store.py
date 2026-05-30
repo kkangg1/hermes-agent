@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_BACKEND = "hindsight"
-HINDSIGHT_URL = os.getenv("HINDSIGHT_URL", "http://localhost:8421")
+HINDSIGHT_URL = os.getenv("HINDSIGHT_URL", "http://localhost:8888")
 HONCHO_URL = os.getenv("HONCHO_URL", "http://localhost:1819")
 TIMEOUT = 3
 
