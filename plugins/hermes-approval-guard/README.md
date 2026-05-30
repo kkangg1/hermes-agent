@@ -1,9 +1,10 @@
 # hermes-approval-guard
 
-Two-stage tool-call supervision plugin for Hermes Agent. Adds security
-review for `write_file`, `patch`, `delegate_task`, and `execute_code`
-— tools not covered by the built-in `approvals.mode`. Disabled by
-default; zero measurable overhead when off.
+Two-stage semantic approval plugin for Hermes Agent via the `pre_tool_call`
+hook. Covers ALL 25+ tools — `write_file`, `patch`, `delegate_task`,
+`execute_code`, and `terminal` — filling the gap left by the built-in
+`approvals.mode` (terminal only). Disabled by default; zero measurable
+overhead when off.
 
 ## Quick Start
 
@@ -16,7 +17,11 @@ plugins:
 plugin_guard:
   enabled: true
   provider: zjic
+  model: qwen-3.6-27b-fast
   fail_open: true
+
+approvals:
+  mode: off   # plugin handles all tools; system HARDLINE remains active
 ```
 
 Restart Hermes, then verify:
@@ -30,84 +35,110 @@ hermes plugins list | grep approval-guard
 ```
 Tool call → pre_tool_call hook
   ├─ SAFE_TOOLS (20+ read/query tools) → ALLOW (0ms)
-  ├─ terminal / process                → delegate to approvals.mode
-  ├─ HARDLINE rules                    → BLOCK (<1ms)
-  ├─ Stage 1: LLM classifier           → ALLOW / DENY / ESCALATE (~500ms)
-  └─ Stage 2: ACP Agent (optional)     → deep review (3-8s)
+  ├─ Terminal with no DANGEROUS regex match → ALLOW (0ms, fast-path)
+  ├─ Stage 1: LLM fast-classify → ALLOW / ESCALATE (~500ms)
+  │   • Uses call_llm(task="approval") with context-aware prompt
+  │   • NEVER outputs DENY — DENY reserved for Stage 2 / system HARDLINE
+  │   • On ALLOW: calls approve_session() to pre-mark DANGEROUS patterns
+  │     → system's check_all_command_guards skips redundant LLM call
+  └─ Stage 2: ACP Agent deep review (3-8s, optional)
+      • Stateless: no persistent session; all context injected in prompt
+      • Context from SessionDB: conversation + full tool call chain
+      • Hindsight-backed: session-level + cross-session pattern memory
+      • Outputs: ALLOW / DENY / MODIFY with structured JSON feedback
 ```
 
-## Stage 1 — Rules + LLM
+**System HARDLINE** (`rm -rf /`, `mkfs`, `dd`, `shutdown`) always active as
+safety net — cannot be bypassed by the plugin or `approvals.mode: off`.
 
-| Mechanism | Latency | Coverage |
-|-----------|:------:|---------|
-| SAFE_TOOLS bypass | 0ms | `read_file`, `search_files`, `web_search`, `vision_analyze`, `session_search`, `skill_view`, `clarify`, `hindsight_recall`, `hindsight_reflect`, and 10+ more |
-| HARDLINE path block | <1ms | `/etc/`, `/boot/`, `/sys/`, `/proc/`, `/dev/`, `~/.ssh/`, `~/.gnupg/` |
-| HARDLINE file block | <1ms | `.env`, `config.yaml`, `id_rsa`, `id_ed25519`, `authorized_keys` |
-| Delegate danger block | <1ms | `"delete all"`, `"rm -rf /"`, `"format disk"`, `"wipe system"`, `"destroy everything"` |
-| LLM classifier | ~500ms | All remaining ambiguous calls via `call_llm(task="approval")` |
+## Design Principles
+
+| Principle | Explanation |
+|-----------|-------------|
+| **No hardcoded DENY in Stage 1** | Risk signals extracted as LLM context only — never hard-block. DENY authority lives in Stage 2 ACP and system HARDLINE. |
+| **LLM: ALLOW / ESCALATE only** | Stage 1 prompt mirrors system's `_smart_approve` ("many flagged commands are false positives, e.g. `python -c print`"). Only outputs ALLOW or ESCALATE. |
+| **Stateless ACP** | No `--resume`, no persistent session. All context (conversation, tool chain, pattern history) injected into each ACP prompt from SessionDB and Hindsight. Zero shared state → concurrent-safe. |
+| **Fail-open** | Broken guard is never more restrictive than no guard. All LLM failures default to ALLOW (`fail_open: true`). |
+| **Terminal fast-path** | Commands with no DANGEROUS regex match (e.g. `git status`, `ls`) skip all LLM calls — 0ms overhead. |
+| **approve_session pre-marking** | When Stage 1 approves a terminal command, patterns are pre-marked via system's `approve_session()`. System's `check_all_command_guards` runs after and skips redundant LLM. |
+
+## Stage 1 — Context Extraction + LLM
+
+| Path | Latency | Description |
+|------|:------:|-------------|
+| SAFE_TOOLS bypass | 0ms | `read_file`, `search_files`, `web_search`, `session_search`, etc. |
+| Terminal fast-path | 0ms | Commands with zero DANGEROUS regex matches |
+| Context extraction | <1ms | Extracts risk signals from system's `detect_dangerous/hardline_command()`; never blocks |
+| LLM classify | ~500ms | `call_llm(task="approval")` — ALLOW / ESCALATE only |
 
 ## Stage 2 — ACP Agent (optional)
 
-Launches a separate Hermes instance via `hermes chat -q --profile approval`
-with `terminal,file,web` toolsets. Returns structured JSON verdict:
+Launches `hermes chat -q --profile approval`. Prompt has 5 sections:
 
-```json
-{"verdict": "ALLOW|DENY|MODIFY", "reason": "...", "suggestion": "..."}
+1. **Recent conversation** — User messages + Agent responses (from SessionDB)
+2. **Current operation** — Tool name, args, risk signals
+3. **Tool call chain** — Full tool history including SAFE_TOOLS (from SessionDB)
+4. **Session approval history** — Previous ACP decisions this session (from Hindsight)
+5. **Cross-session patterns** — Similar operations' ALLOW/DENY history (from Hindsight)
+
+Enable with `plugin_guard.stage2.enabled: true`.
+
+## Relationship with System approvals.mode
+
+```
+Plugin pre_tool_call hook  → ALL tools (semantic review + pre-marking)
+System check_all_command_guards → terminal HARDLINE safety net (always active)
 ```
 
-Enable with `plugin_guard.stage2.enabled: true` and create an `approval` profile.
-
-## Relationship with approvals.mode
-
-```
-terminal commands  → approvals.mode (smart/manual) — unchanged
-write_file / patch → approval-guard (newly protected)
-delegate_task      → approval-guard (newly protected)
-execute_code       → approval-guard (newly protected)
-read/search/query  → bypass both (always safe)
-```
-
-The plugin **extends**, not replaces. Both systems coexist without conflict.
+| Aspect | Built-in `approvals.mode` | This plugin |
+|--------|---------------------------|-------------|
+| Coverage | `terminal` only | ALL 25+ tools |
+| Decision | Regex + zero-context LLM (16 tokens) | Semantic LLM + ACP agent with full session context |
+| Memory | Session-level (`_session_approved`) | Hindsight cross-session pattern bank |
+| Context | None (command string only) | Conversation + tool chain + historical patterns |
+| Denial feedback | "BLOCKED: xxx" | Structured: reason + alternatives + approval_id |
 
 ## Failure Modes
 
-All failure paths default to **fail-open** (`plugin_guard.fail_open: true`):
-
 | Failure | Behavior |
 |---------|----------|
+| `plugin_guard.enabled: false` | Handler returns `None` immediately (~0.1ms) |
 | Config missing/corrupt | Plugin self-disables; all tools pass |
-| Stage 1 LLM unavailable | `fail_open:true` → ALLOW; `fail_open:false` → DENY |
-| Stage 2 ACP crash | `fail_open:true` → ALLOW; `fail_open:false` → DENY |
-| Memory backend down | Silent skip; tool execution unaffected |
+| Stage 1 LLM unavailable | `fail_open:true` → ALLOW; `fail_open:false` → ESCALATE |
+| Stage 2 ACP crash/timeout | `fail_open:true` → ALLOW; `fail_open:false` → DENY |
+| Hindsight backend down | Silent skip; tool execution unaffected |
 | Module import failure | Caught by Hermes plugin loader; not registered |
 
 ## Configuration Reference
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `plugin_guard.enabled` | bool | `false` | Master on/off switch |
+| `plugin_guard.enabled` | bool | `false` | Master switch |
 | `plugin_guard.provider` | str | — | LLM provider for classification |
-| `plugin_guard.model` | str | — | Model name (fast model recommended) |
-| `plugin_guard.fail_open` | bool | `true` | LLM down → allow (safe default) |
+| `plugin_guard.model` | str | — | Model name (fast model, e.g. `qwen-3.6-27b-fast`) |
+| `plugin_guard.fail_open` | bool | `true` | LLM failure → allow (safe default) |
 | `plugin_guard.stage1.timeout` | int | `5` | Seconds for LLM classification |
-| `plugin_guard.stage2.enabled` | bool | `false` | Enable ACP Agent deep review |
+| `plugin_guard.stage2.enabled` | bool | `false` | Enable ACP deep review |
 | `plugin_guard.stage2.profile` | str | `"approval"` | Hermes profile for review agent |
 | `plugin_guard.stage2.timeout` | int | `15` | Seconds for deep review |
 | `plugin_guard.memory.backend` | str | `"hindsight"` | `hindsight`, `honcho`, or `none` |
 | `plugin_guard.memory.bank` | str | `"approval"` | Hindsight bank or Honcho user_id |
 
+Also set `approvals.mode: off` when plugin is enabled — system DANGEROUS
+check is redundant; system HARDLINE remains active regardless.
+
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `plugin.yaml` | Plugin manifest (standalone, hook: `pre_tool_call`) |
-| `__init__.py` | `PluginContext.register_hook` entry |
-| `guard.py` | Main dispatcher: SAFE → HARDLINE → LLM → ACP |
-| `stage1_rules.py` | Pattern-based fast path |
-| `stage1_llm.py` | LLM semantic classifier |
-| `stage2_acp.py` | ACP Agent subprocess call |
-| `feedback.py` | Structured deny messages |
-| `hindsight_store.py` | Memory backend (Hindsight HTTP API / Honcho) |
+| `plugin.yaml` | Manifest (standalone, hook: `pre_tool_call`) |
+| `__init__.py` | `PluginContext.register_hook` entry point |
+| `guard.py` | Dispatcher + SessionDB context query |
+| `stage1_rules.py` | Risk signal extraction (no hard DENY) |
+| `stage1_llm.py` | LLM classify: ALLOW/ESCALATE, system prompt style |
+| `stage2_acp.py` | Stateless ACP: 5-section prompt, Hindsight integration |
+| `feedback.py` | Structured denial messages with alternatives |
+| `hindsight_store.py` | Approval memory: session/pattern queries |
 | `recommended-config.yaml` | Annotated config template |
 
 ## Testing
@@ -115,16 +146,18 @@ All failure paths default to **fail-open** (`plugin_guard.fail_open: true`):
 ```bash
 cd plugins/hermes-approval-guard
 
-# Unit tests (5 scenarios)
-python3 test_unit.py
-
-# Integration tests (9 scenarios, 44 cases)
+# Integration tests (7 scenarios, 41 cases)
 python3 test_integration.py
 ```
+
+Covers: SAFE_TOOLS bypass, context extraction (no hard DENY), terminal
+risk signals, feedback messages, pattern key generation, LLM prompt
+structure.
 
 ## Compatibility
 
 - Hermes ≥ 0.14.0
-- Verified against `get_pre_tool_call_block_message()` at `hermes_cli/plugins.py:1666`
-- Hook callback signature matches `PluginContext.register_hook`
-- All three tool execution paths covered (concurrent, sequential, invoke_tool)
+- Uses `pre_tool_call` plugin hook (`hermes_cli/plugins.py`)
+- Imports `tools.approval` for `detect_dangerous/hardline_command`
+- Imports `hermes_state.SessionDB` for conversation context
+- Optional: Hindsight HTTP API for approval memory
